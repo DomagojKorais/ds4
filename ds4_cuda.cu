@@ -105,6 +105,25 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+/* --dma-streaming only (see docs/DMA_STREAMING.md and
+ * ds4_backend_supports_dma_streaming() in ds4.c): whether model bytes are
+ * worth leaving in the host page cache. 1 keep, -1 drop, 0 undecided/not
+ * applicable. Never settled while g_dma_streaming_mode is off, so plain
+ * --ssd-streaming is unaffected -- see cuda_model_apply_page_cache_policy(). */
+static int g_model_keep_pages;
+static int g_dma_streaming_mode;
+/* Direct-DMA streaming: when the model mapping is registered with the CUDA
+ * driver (cudaHostRegisterReadOnly), a cache miss can cudaMemcpyAsync
+ * straight out of the host page cache -- no pread(), no staging buffer, no
+ * per-job wait for a buffer to be safe to reuse. See
+ * cuda_model_try_register_for_direct_dma(). */
+static int g_model_dma_registered;
+static const void *g_model_dma_registered_ptr;
+static cudaStream_t g_model_dma_stream;
+static int g_model_dma_failed;
+/* Why the registered-mapping DMA path is not live, valid whenever
+ * g_model_dma_registered is 0. Read by ds4_gpu_dma_streaming_status(). */
+static char g_model_dma_reason[192] = "not attempted";
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -281,6 +300,10 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static bool g_device_is_spark = false;
+/* Any unified-memory part, not just a Spark: Jetson and Strix Halo share the
+ * property that host RAM already is the GPU's memory, which is why
+ * --dma-streaming (discrete-only) refuses them. */
+static bool g_device_integrated = false;
 
 extern "C" int ds4_gpu_device_is_spark(void) {
     return g_n_gpus == 1 && g_device_is_spark;
@@ -2089,7 +2112,12 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+    /* g_model_keep_pages > 0 only happens under --dma-streaming (see
+     * cuda_model_apply_page_cache_policy()): a dropped page is exactly what
+     * the registered-mapping DMA path cannot tolerate. Plain --ssd-streaming
+     * never sets it, so this check is a no-op there. */
+    if (g_model_keep_pages > 0 ||
+        getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -2108,7 +2136,8 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd < 0 || g_model_keep_pages > 0 ||
+        getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -2305,6 +2334,25 @@ static int cuda_model_copy_to_device_streamed(
         return 0;
     }
     if (bytes == 0) return 1;
+
+    if (g_model_dma_registered && model_map == g_model_dma_registered_ptr) {
+        /* Straight from the registered, page-cache-backed mapping: no
+         * pread(), no staging buffer, so no chunk-size limit and no wait
+         * for a buffer slot to free up either -- just launch and let the
+         * batch-level drain (cuda_stream_upload_batch::finish()) confirm it
+         * landed. */
+        cudaError_t err = cudaMemcpyAsync(dst, (const char *)model_map + offset, (size_t)bytes,
+                                          cudaMemcpyHostToDevice, g_model_dma_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA direct-DMA copy failed for %s at %.2f MiB: %s\n",
+                    what ? what : "expert", (double)offset / 1048576.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        chunk_idx++;
+        return 1;
+    }
+
     if (g_model_fd < 0 ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
@@ -2692,6 +2740,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
             if (i == 0) g_device_is_spark =
                 prop.integrated && prop.major == 12 && prop.minor == 1;
+            if (i == 0) g_device_integrated = prop.integrated != 0;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         }
@@ -2929,7 +2978,26 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
+    g_device_integrated = false;
     g_cublas_ready = 0;
+
+    /* --dma-streaming teardown. Inlined rather than calling
+     * cuda_model_unregister_for_direct_dma() (defined later in this file,
+     * alongside the rest of the page-cache policy) to avoid a forward
+     * declaration; the state it touches is all file-scope. */
+    if (g_model_dma_registered) {
+        (void)cudaHostUnregister((void *)g_model_dma_registered_ptr);
+        (void)cudaGetLastError();
+        g_model_dma_registered = 0;
+        g_model_dma_registered_ptr = NULL;
+    }
+    g_model_dma_failed = 0;
+    if (g_model_dma_stream) {
+        (void)cudaStreamDestroy(g_model_dma_stream);
+        g_model_dma_stream = NULL;
+    }
+    g_model_keep_pages = 0;
+    g_dma_streaming_mode = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
     for (int d = 0; d < DS4_MAX_GPUS; d++) {
@@ -4494,8 +4562,176 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
     return 0;
 }
 
+/* --dma-streaming only. Whether the model maps to enough host RAM to keep
+ * fully resident in the page cache, which DMA registration requires (a
+ * dropped or never-faulted page is exactly what it cannot tolerate). Only
+ * ever consulted from cuda_model_apply_page_cache_policy(), itself a no-op
+ * unless g_dma_streaming_mode is on, so plain --ssd-streaming never reaches
+ * here. Records its reasoning in g_model_dma_reason for
+ * ds4_gpu_dma_streaming_status(). */
+static int cuda_model_want_host_pages(void) {
+    if (getenv("DS4_CUDA_DROP_MODEL_PAGES") != NULL) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "disabled via DS4_CUDA_DROP_MODEL_PAGES");
+        return 0;
+    }
+    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) return 1;
+    if (g_device_integrated) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "not supported on an integrated GPU (host RAM already is its memory)");
+        return 0;
+    }
+    if (g_model_fd < 0 || g_model_file_size == 0) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason), "no model mapping to register yet");
+        return 0;
+    }
+    uint64_t host_available = 0;
+    if (!ds4_linux_nonmovable_memory(&host_available)) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "could not determine available host memory");
+        return 0;
+    }
+    if (host_available < g_model_file_size) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "model does not fit host RAM (%.2f GiB model, %.2f GiB available)",
+                 (double)g_model_file_size / 1073741824.0,
+                 (double)host_available / 1073741824.0);
+        return 0;
+    }
+    return 1;
+}
+
+/* Unregisters if live, and always clears g_model_dma_failed -- callers use
+ * this to mean "start over" (a new fd/mapping, or DMA streaming toggled
+ * off then on again), not just "unregister if registered". Clearing it
+ * only inside the registered branch would leave a previous decline (wrong
+ * driver quirk, env override, cost over budget) permanently blocking a
+ * retry against a completely different, possibly valid, later mapping. */
+static void cuda_model_unregister_for_direct_dma(void) {
+    if (g_model_dma_registered) {
+        (void)cudaHostUnregister((void *)g_model_dma_registered_ptr);
+        (void)cudaGetLastError();
+        g_model_dma_registered = 0;
+        g_model_dma_registered_ptr = NULL;
+    }
+    g_model_dma_failed = 0;
+}
+
+/* Registering the whole model mapping read-only lets a cache miss
+ * cudaMemcpyAsync directly out of the host page cache instead of pread()ing
+ * into a small staging buffer first. Only called while the pages stay
+ * resident (cuda_model_want_host_pages() decided "keep").
+ *
+ * cudaHostRegister's VRAM cost is driver/flag dependent: measured 7.4 GiB
+ * for an 81 GiB mapping with plain cudaHostRegisterDefault on one driver --
+ * enough to starve the expert cache's own sizing budget outright -- and
+ * 0.158 GiB with cudaHostRegisterReadOnly specifically on another
+ * (cudaHostRegisterDefault fails outright against a PROT_READ mmap there).
+ * Re-measured here via cudaMemGetInfo() before/after rather than trusted,
+ * and still bounded by max_cost in case a different driver needs much more:
+ * the point is to spend a small, known amount of VRAM, not to gamble the
+ * expert cache's own budget on it. See docs/DMA_STREAMING.md. */
+static void cuda_model_try_register_for_direct_dma(const void *model_map, uint64_t model_size) {
+    if (g_model_dma_registered || g_model_dma_failed) return;
+    if (!model_map || model_size == 0) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason), "no model mapping to register yet");
+        return;
+    }
+    if (getenv("DS4_CUDA_NO_DMA_STREAMING") != NULL) {
+        g_model_dma_failed = 1;
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "disabled via DS4_CUDA_NO_DMA_STREAMING");
+        return;
+    }
+    size_t free_before = 0, total_bytes = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_before, &total_bytes), "direct-DMA registration budget check")) {
+        g_model_dma_failed = 1;
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason), "cudaMemGetInfo failed before registration");
+        return;
+    }
+    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size, cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "cudaHostRegister failed: %s", cudaGetErrorString(err));
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr, "ds4: CUDA direct-DMA model registration failed: %s\n", g_model_dma_reason);
+        }
+        (void)cudaGetLastError();
+        g_model_dma_failed = 1;
+        return;
+    }
+    size_t free_after = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_after, &total_bytes), "direct-DMA registration cost check")) {
+        (void)cudaHostUnregister((void *)model_map);
+        (void)cudaGetLastError();
+        g_model_dma_failed = 1;
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason), "cudaMemGetInfo failed after registration");
+        return;
+    }
+    const uint64_t cost = free_before > free_after ? (uint64_t)(free_before - free_after) : 0;
+    const uint64_t max_cost = UINT64_C(2) << 30; /* 2 GiB: a hard, known-small budget. */
+    if (cost > max_cost) {
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason),
+                 "registration cost %.2f GiB exceeds the %.0f GiB budget",
+                 (double)cost / 1073741824.0, (double)max_cost / 1073741824.0);
+        fprintf(stderr, "ds4: %s\n", g_model_dma_reason);
+        (void)cudaHostUnregister((void *)model_map);
+        (void)cudaGetLastError();
+        g_model_dma_failed = 1;
+        return;
+    }
+    if (!g_model_dma_stream &&
+        !cuda_ok(cudaStreamCreateWithFlags(&g_model_dma_stream, cudaStreamNonBlocking),
+                "direct-DMA stream creation")) {
+        (void)cudaHostUnregister((void *)model_map);
+        (void)cudaGetLastError();
+        g_model_dma_failed = 1;
+        snprintf(g_model_dma_reason, sizeof(g_model_dma_reason), "CUDA stream creation failed");
+        return;
+    }
+    g_model_dma_registered = 1;
+    g_model_dma_registered_ptr = model_map;
+    g_model_dma_reason[0] = '\0';
+    fprintf(stderr, "ds4: CUDA direct-DMA model registration: %.2f GiB mapping, %.3f GiB VRAM cost\n",
+            (double)model_size / 1073741824.0, (double)cost / 1073741824.0);
+}
+
+/* --dma-streaming only. Settles g_model_keep_pages and, when the model
+ * qualifies, closes the direct-I/O fd ds4_gpu_set_model_fd() opens below
+ * (direct reads would bypass the very page cache DMA streaming needs) and
+ * registers the mapping for direct DMA. A no-op whenever g_dma_streaming_mode
+ * is off, so plain --ssd-streaming and resident loads are byte-for-byte
+ * unaffected. Called from both ds4_gpu_set_model_fd() and
+ * ds4_gpu_set_dma_streaming(): the placement paths invoke those two in
+ * either order, and the policy needs both the fd and the mode to be final. */
+static void cuda_model_apply_page_cache_policy(void) {
+    if (!g_dma_streaming_mode) return;
+    const int keep = cuda_model_want_host_pages();
+    g_model_keep_pages = keep ? 1 : -1;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA DMA streaming model pages: %s host page cache\n",
+                keep ? "keeping in" : "dropping from");
+    }
+    if (!keep) {
+        cuda_model_unregister_for_direct_dma();
+        return;
+    }
+#if defined(__linux__) && defined(O_DIRECT)
+    if (g_model_direct_fd >= 0) {
+        (void)close(g_model_direct_fd);
+        g_model_direct_fd = -1;
+    }
+#endif
+    cuda_model_try_register_for_direct_dma(g_model_fd_host_base, g_model_file_size);
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
+    /* The registered pointer is about to change (or go away); drop any
+     * registration on the old one before it can point at stale/unmapped
+     * memory. cuda_model_apply_page_cache_policy() below re-registers the
+     * new mapping if the policy still calls for it. */
+    cuda_model_unregister_for_direct_dma();
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -4504,6 +4740,7 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
         g_model_direct_fd = -1;
     }
     g_model_direct_align = 1;
+    g_model_keep_pages = 0;
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
@@ -4527,6 +4764,10 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
             }
         }
 #endif
+        /* Runs after the block above so DMA streaming's own decision (close
+         * direct I/O, register for DMA) has the last word; a no-op when DMA
+         * streaming is off. */
+        cuda_model_apply_page_cache_policy();
     }
     return 1;
 }
@@ -27144,9 +27385,13 @@ struct cuda_stream_upload_batch {
     int finish() {
         if (!active) return 1;
         active = false;
-        if (!g_stream_selected_upload_stream || cuda_ok(
-                cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload"))
+        if (g_model_dma_registered) {
+            if (cuda_ok(cudaStreamSynchronize(g_model_dma_stream), "direct-DMA batch drain"))
+                return 1;
+        } else if (!g_stream_selected_upload_stream || cuda_ok(
+                cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload")) {
             return 1;
+        }
         /* A failed asynchronous copy must not turn into a cache hit later. */
         ds4_gpu_stream_expert_cache_prefetch_finish(true);
         g_stream_expert_by_gate.clear();
@@ -33735,7 +33980,16 @@ extern "C" int ds4_gpu_commit_and_wait_selected_readback(
 
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     const int ok = ds4_gpu_set_model_fd(fd);
-    if (ok) g_model_fd_host_base = model_map;
+    if (ok && model_map != g_model_fd_host_base) {
+        /* ds4_gpu_set_model_fd() above already ran the DMA-streaming
+         * page-cache policy against the default host base; redo it now that
+         * the actual mapping for this fd is known, or a registration would
+         * silently point at the wrong pointer. A no-op when DMA streaming
+         * is off. */
+        cuda_model_unregister_for_direct_dma();
+        g_model_fd_host_base = model_map;
+        if (g_model_fd >= 0) cuda_model_apply_page_cache_policy();
+    }
     return ok;
 }
 
@@ -33763,6 +34017,28 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+}
+
+/* See docs/DMA_STREAMING.md. Called from ds4_engine_open_internal()
+ * alongside ds4_gpu_set_ssd_streaming(), which by this point is always
+ * already true when enabled is (ds4.c implies ssd_streaming from
+ * dma_streaming before either setter runs). Re-settles the page-cache
+ * policy because this call can arrive either before or after
+ * ds4_gpu_set_model_fd()/ds4_gpu_set_model_fd_for_map(). */
+extern "C" void ds4_gpu_set_dma_streaming(bool enabled) {
+    g_dma_streaming_mode = enabled ? 1 : 0;
+    if (!enabled) {
+        cuda_model_unregister_for_direct_dma();
+        g_model_keep_pages = 0;
+        return;
+    }
+    if (g_model_fd >= 0) cuda_model_apply_page_cache_policy();
+}
+
+extern "C" int ds4_gpu_dma_streaming_status(const char **reason) {
+    if (g_model_dma_registered) return 1;
+    if (reason) *reason = g_model_dma_reason[0] ? g_model_dma_reason : "not attempted";
+    return 0;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
