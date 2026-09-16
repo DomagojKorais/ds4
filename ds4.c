@@ -67780,8 +67780,25 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         e->ssd_streaming_cache_bytes != 0) {
         return true;
     }
+    /* Auto-sizing was validated on CUDA for DeepSeek V4.1 Flash and never
+     * extended to plain V4 (Flash/PRO) -- an oversight, not a finding that
+     * it is unsafe there: ds4_ssd_auto_cache_plan() and the byte-measuring
+     * helpers it calls below only read tensor sizes and counts from the
+     * loaded weights, with no family-specific assumptions. Widening this to
+     * dma_streaming only (not plain --ssd-streaming) keeps this change from
+     * touching a CUDA V4 Flash/PRO host that isn't using the new mode: it
+     * still needs an explicit --ssd-streaming-cache-experts, exactly as
+     * before. Left unfixed for --dma-streaming, a plain V4 CUDA run without
+     * an explicit budget leaves the streaming target at 0, so the cache has
+     * nothing to size against and instead self-sizes to whatever the
+     * largest single request happens to be -- one full layer's worth of
+     * experts on an ordinary prefill chunk, and nothing more. That leaves
+     * most of the card's VRAM idle and the decode-time hit rate at zero,
+     * since a fresh layer's experts evict the previous layer's every step. */
     if (!ds4_backend_supports_streaming_auto_cache(e->backend) &&
-        !(e->backend == DS4_BACKEND_CUDA && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)) {
+        !(e->backend == DS4_BACKEND_CUDA &&
+          (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+           (e->dma_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4)))) {
         return true;
     }
 

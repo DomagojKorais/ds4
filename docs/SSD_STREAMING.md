@@ -11,6 +11,13 @@ Metal supports streaming for DeepSeek and GLM. CUDA has streaming paths too,
 and ROCm supports GLM 5.2/5.3 streaming. Do not infer support for every model
 and tensor layout from the existence of the flag.
 
+On a discrete CUDA card, if the model fits in host RAM but not VRAM,
+[DMA streaming](DMA_STREAMING.md) (`--dma-streaming`) is usually the better
+choice: it DMAs routed-expert misses straight from a registered model
+mapping instead of reading them from disk, since there is no disk read
+needed once the whole file is already in RAM. Use SSD streaming instead when
+the model does not fit in RAM either.
+
 ## Start with the automatic budget
 
 ```sh

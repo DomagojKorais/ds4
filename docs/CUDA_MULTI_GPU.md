@@ -36,6 +36,21 @@ This is also the multi-GPU placement mode for GLM. Startup refuses a layout
 that would require unsupported CPU execution; reduce context or choose a
 smaller model if necessary.
 
+## One discrete card, model larger than VRAM
+
+A single 24 GB card cannot hold Flash Q2 resident, but it can run it if the
+host has enough RAM to keep the GGUF cached:
+
+```sh
+./ds4 --cuda -m ds4flash.gguf --dma-streaming --ctx 32768
+```
+
+This DMAs routed-expert cache misses straight from a registered model
+mapping instead of resident weights; see
+[DMA streaming](DMA_STREAMING.md) for how it works, the one condition it
+needs, and measured numbers. Use [SSD streaming](SSD_STREAMING.md) instead
+when the model does not fit in host RAM either.
+
 ## Batched prefill on consumer Ampere and Ada
 
 The token-tile HMMA attention kernel is not admitted on sm_86/sm_89. Its

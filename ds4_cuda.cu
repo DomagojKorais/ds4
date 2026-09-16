@@ -27453,7 +27453,23 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            int reserve_env_present = 0;
+            uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_SSD_CACHE_RESERVE_MB", &reserve_env_present);
+            if (!reserve_env_present) {
+                /* Discrete --dma-streaming's reserve additionally has to cover
+                 * two allocators that do not back off gracefully under memory
+                 * pressure -- cuda_tmp_alloc()'s shared scratch slab (grown to
+                 * the largest request ever seen) and
+                 * cuda_model_arena_alloc()'s uncapped non-routed weight arena
+                 * -- so a shortfall there is a hard request failure, not a
+                 * slowdown. Raised twice chasing real failures this way: 8 GiB
+                 * (plain --ssd-streaming's unchanged reserve) OOM'd through
+                 * ds4-server on a short prompt; 9 GiB left 0.19 GiB free on an
+                 * 8355-token tool-calling prefill; 10 GiB left 3.47+ GiB,
+                 * validated at --ctx 32768 and --ctx 131072. See
+                 * docs/DMA_STREAMING.md. */
+                reserve = (g_dma_streaming_mode ? UINT64_C(10) : UINT64_C(8)) << 30;
+            }
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
