@@ -116,6 +116,9 @@ static int g_xdev_force_cuda_peer;
 static int g_xdev_force_host_bounce;
 static int g_cuda_disable_qkv_rms_fused;
 static int g_cuda_no_window_attention;
+/* Token-tile HMMA attention. Opt out on parts where its ldmatrix ring
+ * addressing reads out of bounds; see ds4_cuda_attn_tokentile_arch_ok(). */
+static int g_cuda_no_tokentile_attn;
 static int g_cuda_decode_heads8_online;
 static int g_cuda_decode_score4;
 static int g_cuda_decode_score8;
@@ -310,6 +313,7 @@ static void cuda_xdev_env_refresh(void) {
 static void cuda_decode_dispatch_env_refresh(void) {
     g_cuda_disable_qkv_rms_fused = getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL;
     g_cuda_no_window_attention = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    g_cuda_no_tokentile_attn = getenv("DS4_CUDA_NO_TOKENTILE_ATTENTION") != NULL;
     g_cuda_decode_heads8_online = getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL;
     g_cuda_decode_score4 = getenv("DS4_CUDA_DECODE_SCORE4") != NULL;
     g_cuda_decode_score8 = getenv("DS4_CUDA_DECODE_SCORE8") != NULL;
@@ -11579,15 +11583,30 @@ static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total == 88576ull,
               "M32/R32 total dynamic shared memory changed unexpectedly");
 static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
+/* On GeForce Ampere/Ada (sm_86/sm_89) this kernel's ldmatrix ring addressing
+ * reads past the shared-memory allocation sized from the compile-time
+ * budget: compute-sanitizer reports an invalid 16-byte __shared__ read in
+ * tt_hmma_score_stage on the first ratio-4 layer of any batched prefill, and
+ * the prompt dies with an illegal memory access. The validated single-GPU
+ * target for this kernel is Blackwell (the L40S deployments reach it only
+ * under tensor parallelism, which the g_n_gpus == 1 gate already excludes),
+ * so admit datacenter Ampere (sm_80) and sm_90+ and let the consumer parts
+ * take the correct non-tiled path. DS4_CUDA_NO_TOKENTILE_ATTENTION forces
+ * that fallback anywhere; DS4_CUDA_TOKENTILE_ATTENTION re-admits this kernel
+ * for anyone wanting to measure or fix it. */
 static int ds4_cuda_attn_tokentile_arch_ok(void) {
     int device = 0;
     cudaDeviceProp prop;
+    if (g_cuda_no_tokentile_attn) return 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
-    return prop.major >= 8;
+    if (getenv("DS4_CUDA_TOKENTILE_ATTENTION") != NULL) return prop.major >= 8;
+    if (prop.major > 8) return 1;
+    /* sm_80 keeps 163 KB of shared memory per block; sm_86/sm_89 only 99 KB. */
+    return prop.major == 8 && prop.minor == 0;
 }
 
 __global__ static void __launch_bounds__(256, 4)

@@ -36,6 +36,19 @@ This is also the multi-GPU placement mode for GLM. Startup refuses a layout
 that would require unsupported CPU execution; reduce context or choose a
 smaller model if necessary.
 
+## Batched prefill on consumer Ampere and Ada
+
+The token-tile HMMA attention kernel is not admitted on sm_86/sm_89. Its
+shared-memory ring addressing reads out of bounds there: compute-sanitizer
+reports an invalid 16-byte `__shared__` read in `tt_hmma_score_stage` on the
+first ratio-4 layer, and any prompt of 128 tokens or more dies with an illegal
+memory access. Those parts take the correct non-tiled path instead. sm_80 and
+sm_90+ are unchanged, and the L40S tensor-parallel deployments never reached
+this kernel because it requires single-GPU placement.
+
+`DS4_CUDA_TOKENTILE_ATTENTION=1` re-admits it for anyone measuring or fixing
+the kernel; `DS4_CUDA_NO_TOKENTILE_ATTENTION=1` forces the fallback anywhere.
+
 ## Flash tensor parallelism
 
 `--cuda-tensor-parallel` pairs GPUs and divides routed-expert work inside
