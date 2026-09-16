@@ -68273,7 +68273,16 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     uint64_t total_cache_bytes = e->ssd_streaming_cache_bytes;
     uint64_t prefill_headroom_bytes = 0;
     uint64_t budget_after_prefill_headroom = total_cache_bytes;
-    if (total_cache_bytes != 0) {
+    /* Hybrid streaming doesn't reserve this: most routed-expert layers are
+     * pinned to host RAM there (bypassing the VRAM cache), and
+     * routed_moe_launch() (ds4_cuda.cu) now falls back to a smaller token
+     * chunk instead of failing when the VRAM cache can't fit a batch's
+     * unique experts, so an undersized cache costs prefill throughput, not
+     * correctness. Reserving a full plain-SSD-streaming-sized prefill
+     * headroom here only shrinks the dynamic cache hybrid mode actually
+     * gets to use, for a burst hybrid's own graceful fallback already
+     * covers. See docs/DMA_STREAMING.md. */
+    if (total_cache_bytes != 0 && !e->hybrid_streaming) {
         if (!ds4_streaming_prefill_headroom_bytes(&e->weights,
                                                   &prefill_headroom_bytes)) {
             fprintf(stderr,
@@ -70209,8 +70218,20 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
+    /* The prefill headroom exists to keep the old hard-fail cache-growth path
+     * (see ds4_cuda.cu's routed_moe_launch()) from OOMing mid-prefill. Hybrid
+     * streaming doesn't need that cushion: most routed-expert layers are
+     * pinned to host RAM there, bypassing the VRAM cache entirely, and
+     * routed_moe_launch() now falls back to a smaller token chunk instead of
+     * failing whenever the VRAM cache can't fit a batch's unique experts, so
+     * an undersized cache costs prefill throughput, not correctness or a
+     * crash. Charging hybrid runs the same fixed reserve as plain
+     * SSD streaming only blocks large-context hybrid sessions that would
+     * otherwise fit. See docs/DMA_STREAMING.md. */
+    const uint64_t prefill_headroom =
+        e->hybrid_streaming ? 0 : e->ssd_streaming_prefill_headroom_bytes;
     const uint64_t fixed = ds4_add_sat_u64(weights,
-        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
+        ds4_add_sat_u64(graph_bytes, 2u * gib + prefill_headroom));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
     if (fixed >= budget || (expert && budget - fixed < expert)) {

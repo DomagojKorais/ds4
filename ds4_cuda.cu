@@ -217,6 +217,17 @@ typedef struct {
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
+/* Adaptive token-chunk hint for routed_moe_launch()'s SSD-streaming split
+ * (see there): the largest per-layer MoE token count known not to exceed
+ * the cache's real, currently-achievable capacity. Starts at "no hint yet"
+ * (try the whole batch first); a capacity failure shrinks it, and it stays
+ * shrunk for the rest of the process -- real available VRAM only gets
+ * tighter as the KV cache grows during a long prefill, never looser, so
+ * there is no case where re-growing it would help, and not doing so avoids
+ * oscillation. This makes a long prefill (large --ctx) converge to a
+ * working chunk size within the first layer or two instead of rediscovering
+ * it by repeated failed attempts on every single layer. */
+static uint32_t g_moe_ssd_split_hint = UINT32_MAX;
 static uint32_t g_stream_expert_budget;
 static uint64_t g_stream_expert_bytes;
 struct cuda_stream_expert_slot {
@@ -24933,10 +24944,74 @@ static int routed_moe_launch(
         const ds4_gpu_stream_expert_table table = {
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
-        if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
-            !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                &table, selected, n_tokens * n_expert)) return 0;
-        allow_streaming = 1;
+        if ((uint64_t)n_tokens * n_expert > UINT32_MAX) return 0;
+        /* Try at most g_moe_ssd_split_hint tokens' worth of unique routed
+         * experts in one load. Skipping straight to the hinted chunk size
+         * (instead of always trying the full n_tokens first) matters once a
+         * long prefill has already learned the real, currently-achievable
+         * cache capacity is well under one layer's token count: without
+         * this, EVERY layer would re-waste a doomed full-size attempt
+         * before falling back, and a --ctx in the 100K range easily has
+         * hundreds of layer-major chunks. */
+        const bool full_batch = n_tokens <= g_moe_ssd_split_hint;
+        if (full_batch && ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                &table, selected, n_tokens * n_expert)) {
+            allow_streaming = 1;
+        } else {
+            /* This batch's unique routed experts for this one layer don't fit
+             * the SSD-streaming cache in a single load -- a large prefill
+             * chunk against a model whose total expert count comfortably
+             * exceeds the cache budget (e.g. 384 experts/layer vs. a
+             * few-hundred-slot cache sized for steady-state decode). Shrink
+             * the shared hint (this is the only place it changes, and it
+             * only ever shrinks: real available VRAM tightens as the KV
+             * cache grows during a long prefill, never loosens, so a stale
+             * smaller hint is always still safe) and replay this range as a
+             * sequence of hint-sized chunks. MoE has no cross-token
+             * dependency (every row's routed compute is self-contained), so
+             * chunking is exact, not an approximation -- output is
+             * byte-identical to processing the full batch in one shot, just
+             * slower. Each chunk recurses into routed_moe_launch, which
+             * shrinks the hint again and re-chunks if even that doesn't fit;
+             * this bottoms out at n_tokens == 1 (unique experts capped at
+             * n_expert, always within any sane budget), where a failure is a
+             * genuine resource failure, not a batching one, and still
+             * returns 0 rather than looping forever.
+             * ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor()
+             * already syncs the device (its selected-id readback is a plain
+             * cudaMemcpy), so one chunk's cache eviction can never race the
+             * previous chunk's still-in-flight compute. */
+            if (n_tokens <= 1) return 0;
+            if (full_batch) {
+                const uint32_t shrunk = n_tokens / 2u ? n_tokens / 2u : 1u;
+                if (shrunk < g_moe_ssd_split_hint) g_moe_ssd_split_hint = shrunk;
+            }
+            const uint32_t chunk = g_moe_ssd_split_hint < n_tokens ? g_moe_ssd_split_hint : n_tokens / 2u;
+            const uint64_t x_stride = (uint64_t)expert_in_dim * sizeof(float);
+            const uint64_t sel_stride = (uint64_t)n_expert * sizeof(int32_t);
+            const uint64_t w_stride = (uint64_t)n_expert * sizeof(float);
+            const uint64_t out_stride = (uint64_t)out_dim * sizeof(float);
+            for (uint32_t off = 0; off < n_tokens; ) {
+                const uint32_t take = n_tokens - off < chunk ? n_tokens - off : chunk;
+                ds4_gpu_tensor *xN = ds4_gpu_tensor_view(x, (uint64_t)off * x_stride, (uint64_t)take * x_stride);
+                ds4_gpu_tensor *selN = ds4_gpu_tensor_view(selected, (uint64_t)off * sel_stride, (uint64_t)take * sel_stride);
+                ds4_gpu_tensor *wN = ds4_gpu_tensor_view(weights, (uint64_t)off * w_stride, (uint64_t)take * w_stride);
+                ds4_gpu_tensor *outN = ds4_gpu_tensor_view(out, (uint64_t)off * out_stride, (uint64_t)take * out_stride);
+                const int ok = xN && selN && wN && outN &&
+                    routed_moe_launch(outN, gate, up, mid, down, model_map, model_size,
+                        gate_offset, up_offset, down_offset, gate_type, down_type,
+                        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                        expert_in_dim, expert_mid_dim, out_dim, selN, wN, n_total_expert, n_expert,
+                        clamp, xN, layer_index, take, allow_streaming, owned_filtered);
+                ds4_gpu_tensor_free(xN);
+                ds4_gpu_tensor_free(selN);
+                ds4_gpu_tensor_free(wN);
+                ds4_gpu_tensor_free(outN);
+                if (!ok) return 0;
+                off += take;
+            }
+            return 1;
+        }
     }
 
     /* The aligned artifacts replace the raw expert tensors on integrated
