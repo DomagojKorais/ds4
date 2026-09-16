@@ -56,6 +56,56 @@ Historical PRO Q2 measurements on the M3 Ultra are retained in this chart:
 
 ![PRO Q2 on M3 Ultra](../speed-bench/pro_model_m3_ultra_ts.svg)
 
+## DMA streaming on a single discrete card
+
+A 24 GB card cannot hold Flash Q2 (80.8 GiB) resident. This is a capacity
+result, not a like-for-like comparison against the resident unified-memory
+machines above: these rows move routed experts across PCIe on every token
+via [DMA streaming](DMA_STREAMING.md), so the curve is flatter and the
+absolute numbers are lower. Full data: [RTX 3090](../speed-bench/rtx3090.csv).
+
+September 16, 2026. RTX 3090 (24 GB, sm_86), 125 GB system RAM, driver
+580.173.02, CUDA 12.8, DeepSeek V4 Flash Q2 (IQ2_XXS, 80.8 GiB),
+`--dma-streaming --ctx N`, no explicit `--ssd-streaming-cache-experts`
+(auto-sized to 1103 experts / 7.27 GiB). 2048-token prefill intervals, 128
+greedy generation tokens per frontier, average over 32 frontiers from 2K to
+64K: 340.65 t/s prefill, 14.73 t/s generation.
+
+| Machine | Context | Prefill | Generation |
+| --- | ---: | ---: | ---: |
+| RTX 3090, 24 GB, DMA-streamed | 2048 | 309.83 t/s | 15.95 t/s |
+| RTX 3090, 24 GB, DMA-streamed | 16384 | 356.87 t/s | 15.20 t/s |
+| RTX 3090, 24 GB, DMA-streamed | 32768 | 346.50 t/s | 14.32 t/s |
+| RTX 3090, 24 GB, DMA-streamed | 65536 | 330.20 t/s | 14.03 t/s |
+
+![RTX 3090 DMA-streaming throughput](../speed-bench/rtx3090_ts.svg)
+
+### Transport comparison at a fixed cache size
+
+Same machine and model, `--ctx 32768`, a 512-expert cache forced explicitly
+on both sides (`--ssd-streaming-cache-experts 512`, deliberately undersized
+enough to thrash heavily -- ordinary use should prefer the auto-sized budget
+above) to isolate the copy transport from the cache-size effect covered
+above:
+
+| | `--ssd-streaming` (pread + staging buffer) | `--dma-streaming` (registered-mapping DMA) |
+| --- | ---: | ---: |
+| Prefill (avg, 32 frontiers) | 68.09 t/s | -- |
+| Generation (avg, 32 frontiers) | 2.71 t/s | -- |
+
+The matching fixed-cache `--dma-streaming` sweep could not be completed in
+this environment (a host-level low-memory guard repeatedly killed the
+benchmark process while the host page cache warmed the 80.8 GiB model file
+-- `free` dipped as expected while `available` stayed near 120 GiB the whole
+time, i.e. reclaimable cache, not real pressure). The auto-sized row above
+(340.65 / 14.73 t/s, more cache and the new transport together) and the
+manual spot checks in [DMA streaming](DMA_STREAMING.md) (byte-identical
+output across resident, `--ssd-streaming`, and `--dma-streaming` at
+`--temp 0`; a 41K-token and a 126K-token prompt both completing under
+`--dma-streaming`) are the evidence this PR ships; a like-for-like
+fixed-cache transport number is left for a follow-up measurement on a host
+without this constraint.
+
 ## What to compare next
 
 - For SSD streaming, record the effective cache and distinguish cold startup
