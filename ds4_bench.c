@@ -67,6 +67,7 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    bool dma_streaming;
     bool cuda_tensor_parallel;
     bool show_output;
     bool teacher_forced_decode;
@@ -330,6 +331,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--dma-streaming")) {
+            c.dma_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -667,6 +670,7 @@ int main(int argc, char **argv) {
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .dma_streaming = cfg.dma_streaming,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
         .tp = cfg.tp,
@@ -727,7 +731,7 @@ int main(int argc, char **argv) {
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
-                       cfg.ssd_streaming);
+                       cfg.ssd_streaming || cfg.dma_streaming);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};

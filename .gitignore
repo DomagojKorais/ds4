@@ -65,6 +65,7 @@
 /tests/test_cuda_reductions
 /tests/test_cuda_shared
 /tests/test_cuda_ssd_cache
+/tests/test_cuda_dma_streaming
 /tests/test_cuda_ssd_batch
 /tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf

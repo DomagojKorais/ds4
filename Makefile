@@ -390,6 +390,16 @@ tests/test_cuda_ssd_cache: tests/test_cuda_ssd_cache.o ds4_cuda.o ds4_image.o $(
 test-cuda-ssd-cache: tests/test_cuda_ssd_cache
 	./tests/test_cuda_ssd_cache
 
+tests/test_cuda_dma_streaming.o: tests/test_cuda_dma_streaming.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
+
+tests/test_cuda_dma_streaming: tests/test_cuda_dma_streaming.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-dma-streaming
+test-cuda-dma-streaming: tests/test_cuda_dma_streaming
+	./tests/test_cuda_dma_streaming
+
 tests/test_cuda_q8_rows.o: tests/test_cuda_q8_rows.c ds4_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1060,6 +1070,7 @@ clean:
 	rm -f tests/test_cuda_reductions
 	rm -f tests/test_cuda_shared
 	rm -f tests/test_cuda_ssd_cache
+	rm -f tests/test_cuda_dma_streaming
 	rm -f tests/test_cuda_ssd_batch
 	rm -f tests/test_cuda_tp
 	rm -f tests/test_cuda_tp_repack

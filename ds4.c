@@ -439,6 +439,20 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     return false;
 }
 
+/* DMA streaming registers the whole model mapping with the CUDA driver and
+ * DMAs routed-expert cache misses straight out of the host page cache; it
+ * needs the model to fit in host RAM and is validated on discrete CUDA
+ * only. ROCm's hipHostRegister equivalent is untested here, so it is not
+ * admitted even under a ROCm build. */
+static bool ds4_backend_supports_dma_streaming(ds4_backend backend) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    return backend == DS4_BACKEND_CUDA;
+#else
+    (void)backend;
+    return false;
+#endif
+}
+
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
 #ifdef DS4_ROCM_BUILD
@@ -42281,6 +42295,7 @@ struct ds4_engine {
     bool ssd_streaming_full_layers_set;
     bool ssd_streaming_budget_finalized;
     bool ssd_streaming_static_decode_map;
+    bool dma_streaming;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
@@ -67821,8 +67836,25 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
         e->ssd_streaming_cache_bytes != 0) {
         return true;
     }
+    /* Auto-sizing was validated on CUDA for DeepSeek V4.1 Flash and never
+     * extended to plain V4 (Flash/PRO) -- an oversight, not a finding that
+     * it is unsafe there: ds4_ssd_auto_cache_plan() and the byte-measuring
+     * helpers it calls below only read tensor sizes and counts from the
+     * loaded weights, with no family-specific assumptions. Widening this to
+     * dma_streaming only (not plain --ssd-streaming) keeps this change from
+     * touching a CUDA V4 Flash/PRO host that isn't using the new mode: it
+     * still needs an explicit --ssd-streaming-cache-experts, exactly as
+     * before. Left unfixed for --dma-streaming, a plain V4 CUDA run without
+     * an explicit budget leaves the streaming target at 0, so the cache has
+     * nothing to size against and instead self-sizes to whatever the
+     * largest single request happens to be -- one full layer's worth of
+     * experts on an ordinary prefill chunk, and nothing more. That leaves
+     * most of the card's VRAM idle and the decode-time hit rate at zero,
+     * since a fresh layer's experts evict the previous layer's every step. */
     if (!ds4_backend_supports_streaming_auto_cache(e->backend) &&
-        !(e->backend == DS4_BACKEND_CUDA && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)) {
+        !(e->backend == DS4_BACKEND_CUDA &&
+          (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+           (e->dma_streaming && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4)))) {
         return true;
     }
 
@@ -70183,6 +70215,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
+    e->dma_streaming = opt->dma_streaming;
+    /* --dma-streaming selects the transport (DMA from a registered model
+     * mapping instead of the SSD pread path); it does not fork a second
+     * streaming engine. It still needs the bounded expert cache and
+     * miss-handling that ssd_streaming gates elsewhere in this file, so
+     * turn that on too. The two flags read as mutually exclusive to the
+     * user (see the refusal below) because dma_streaming always implies
+     * ssd_streaming, never the other way around. */
+    if (e->dma_streaming) e->ssd_streaming = true;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (opt->vision_path && opt->vision_path[0]) {
@@ -70426,6 +70467,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (opt->dma_streaming && opt->ssd_streaming) {
+        fprintf(stderr,
+                "ds4: --dma-streaming and --ssd-streaming are mutually exclusive; "
+                "--dma-streaming already streams (see docs/DMA_STREAMING.md)\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->dma_streaming && !ds4_backend_supports_dma_streaming(e->backend)) {
+        fprintf(stderr, "ds4: --dma-streaming is currently supported only with --cuda on a discrete GPU\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -70979,6 +71034,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        ds4_gpu_set_dma_streaming(e->dma_streaming);
         if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -71381,6 +71437,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        if (e->dma_streaming) {
+            const char *reason = NULL;
+            if (!ds4_gpu_dma_streaming_status(&reason)) {
+                fprintf(stderr,
+                        "ds4: --dma-streaming could not be enabled: %s\n",
+                        reason ? reason : "unknown reason");
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {

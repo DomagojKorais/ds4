@@ -15440,6 +15440,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--dma-streaming")) {
+            c.engine.dma_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -15671,7 +15673,7 @@ int main(int argc, char **argv) {
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        ds4_engine_prefill_chunk(engine),
-                       cfg.engine.ssd_streaming,
+                       cfg.engine.ssd_streaming || cfg.engine.dma_streaming,
                        slot_count);
 
     server s = {0};

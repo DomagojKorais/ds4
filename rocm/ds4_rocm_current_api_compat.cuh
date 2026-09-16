@@ -125,6 +125,20 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_stream_batch_selected_cache.loaded = 0;
 }
 
+/* DMA streaming's cudaHostRegister-based path is validated on discrete CUDA
+ * only; ROCm's hipHostRegister equivalent is untested (see docs/
+ * DMA_STREAMING.md). ds4_backend_supports_dma_streaming() in ds4.c already
+ * refuses it under a ROCm build before this could be reached with
+ * enabled=true. */
+extern "C" void ds4_gpu_set_dma_streaming(bool enabled) {
+    (void)enabled;
+}
+
+extern "C" int ds4_gpu_dma_streaming_status(const char **reason) {
+    if (reason) *reason = "not implemented for ROCm";
+    return 0;
+}
+
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model = enabled ? 1 : 0;
 }

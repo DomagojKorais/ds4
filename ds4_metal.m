@@ -4624,6 +4624,18 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
     }
 }
 
+/* DMA streaming is a discrete-CUDA-only transport (see docs/DMA_STREAMING.md);
+ * ds4_backend_supports_dma_streaming() in ds4.c already refuses it on Metal
+ * before this could ever be reached with enabled=true. */
+void ds4_gpu_set_dma_streaming(bool enabled) {
+    (void)enabled;
+}
+
+int ds4_gpu_dma_streaming_status(const char **reason) {
+    if (reason) *reason = "requires a CUDA build on a discrete GPU";
+    return 0;
+}
+
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
 }
