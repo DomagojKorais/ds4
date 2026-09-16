@@ -1811,7 +1811,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 log_context_memory(cfg->engine.backend,
                                    cfg->gen.ctx_size,
                                    ds4_engine_prefill_chunk(engine),
-                                   cfg->engine.ssd_streaming);
+                                   cfg->engine.ssd_streaming || cfg->engine.dma_streaming);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
@@ -2058,6 +2058,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--dma-streaming")) {
+            c.engine.dma_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -2407,7 +2409,7 @@ int main(int argc, char **argv) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
                            ds4_engine_prefill_chunk(engine),
-                           cfg.engine.ssd_streaming);
+                           cfg.engine.ssd_streaming || cfg.engine.dma_streaming);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;

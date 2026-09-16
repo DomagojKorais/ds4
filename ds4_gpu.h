@@ -238,6 +238,12 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
+/* Discrete CUDA only. See docs/DMA_STREAMING.md. Real on ds4_cuda.cu; a
+ * no-op elsewhere. ds4_gpu_dma_streaming_status() reports whether the
+ * registered-mapping DMA path is actually live and, if not, why: it is
+ * valid to call any time, including before ds4_gpu_set_dma_streaming(). */
+void ds4_gpu_set_dma_streaming(bool enabled);
+int ds4_gpu_dma_streaming_status(const char **reason);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);

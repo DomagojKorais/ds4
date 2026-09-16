@@ -620,7 +620,8 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
         return 0;
     }
-    if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
+    if (opt->backend == DS4_BACKEND_CUDA &&
+        (opt->cuda_tensor_parallel || opt->ssd_streaming || opt->dma_streaming)) {
         tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
         return 0;
     }

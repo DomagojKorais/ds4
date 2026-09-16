@@ -1210,6 +1210,7 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    bool dma_streaming;
     bool self_test_extractors;
     bool validate_cases;
     bool list_cases;
@@ -1721,6 +1722,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--dma-streaming")) {
+            c.dma_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -4788,6 +4791,7 @@ int main(int argc, char **argv) {
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .dma_streaming = cfg.dma_streaming,
         .distributed = cfg.dist,
         .tp = cfg.tp,
     };
@@ -4847,7 +4851,7 @@ int main(int argc, char **argv) {
     log_context_memory(cfg.backend,
                        cfg.ctx_size,
                        cfg.prefill_chunk,
-                       cfg.ssd_streaming);
+                       cfg.ssd_streaming || cfg.dma_streaming);
 
     ds4_tp *tp_leader = NULL;
     if (cfg.tp.role == DS4_TP_LEADER) {
