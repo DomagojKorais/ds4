@@ -24891,7 +24891,44 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* Forward declaration: routed_moe_launch() (the public entry, defined after
+ * routed_moe_launch_once() below) wraps a single attempt with a token-range
+ * split/retry fallback, and that fallback recurses back into
+ * routed_moe_launch() for each sub-range -- see the comment on
+ * routed_moe_launch_split() for why the split lives outside
+ * routed_moe_launch_once() rather than only around its cache-load step. */
 static int routed_moe_launch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        int allow_streaming,
+        int owned_filtered);
+
+static int routed_moe_launch_once(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up,
@@ -24944,74 +24981,15 @@ static int routed_moe_launch(
         const ds4_gpu_stream_expert_table table = {
             model_map, model_size, layer_index, n_total_expert,
             gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
-        if ((uint64_t)n_tokens * n_expert > UINT32_MAX) return 0;
-        /* Try at most g_moe_ssd_split_hint tokens' worth of unique routed
-         * experts in one load. Skipping straight to the hinted chunk size
-         * (instead of always trying the full n_tokens first) matters once a
-         * long prefill has already learned the real, currently-achievable
-         * cache capacity is well under one layer's token count: without
-         * this, EVERY layer would re-waste a doomed full-size attempt
-         * before falling back, and a --ctx in the 100K range easily has
-         * hundreds of layer-major chunks. */
-        const bool full_batch = n_tokens <= g_moe_ssd_split_hint;
-        if (full_batch && ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                &table, selected, n_tokens * n_expert)) {
-            allow_streaming = 1;
-        } else {
-            /* This batch's unique routed experts for this one layer don't fit
-             * the SSD-streaming cache in a single load -- a large prefill
-             * chunk against a model whose total expert count comfortably
-             * exceeds the cache budget (e.g. 384 experts/layer vs. a
-             * few-hundred-slot cache sized for steady-state decode). Shrink
-             * the shared hint (this is the only place it changes, and it
-             * only ever shrinks: real available VRAM tightens as the KV
-             * cache grows during a long prefill, never loosens, so a stale
-             * smaller hint is always still safe) and replay this range as a
-             * sequence of hint-sized chunks. MoE has no cross-token
-             * dependency (every row's routed compute is self-contained), so
-             * chunking is exact, not an approximation -- output is
-             * byte-identical to processing the full batch in one shot, just
-             * slower. Each chunk recurses into routed_moe_launch, which
-             * shrinks the hint again and re-chunks if even that doesn't fit;
-             * this bottoms out at n_tokens == 1 (unique experts capped at
-             * n_expert, always within any sane budget), where a failure is a
-             * genuine resource failure, not a batching one, and still
-             * returns 0 rather than looping forever.
-             * ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor()
-             * already syncs the device (its selected-id readback is a plain
-             * cudaMemcpy), so one chunk's cache eviction can never race the
-             * previous chunk's still-in-flight compute. */
-            if (n_tokens <= 1) return 0;
-            if (full_batch) {
-                const uint32_t shrunk = n_tokens / 2u ? n_tokens / 2u : 1u;
-                if (shrunk < g_moe_ssd_split_hint) g_moe_ssd_split_hint = shrunk;
-            }
-            const uint32_t chunk = g_moe_ssd_split_hint < n_tokens ? g_moe_ssd_split_hint : n_tokens / 2u;
-            const uint64_t x_stride = (uint64_t)expert_in_dim * sizeof(float);
-            const uint64_t sel_stride = (uint64_t)n_expert * sizeof(int32_t);
-            const uint64_t w_stride = (uint64_t)n_expert * sizeof(float);
-            const uint64_t out_stride = (uint64_t)out_dim * sizeof(float);
-            for (uint32_t off = 0; off < n_tokens; ) {
-                const uint32_t take = n_tokens - off < chunk ? n_tokens - off : chunk;
-                ds4_gpu_tensor *xN = ds4_gpu_tensor_view(x, (uint64_t)off * x_stride, (uint64_t)take * x_stride);
-                ds4_gpu_tensor *selN = ds4_gpu_tensor_view(selected, (uint64_t)off * sel_stride, (uint64_t)take * sel_stride);
-                ds4_gpu_tensor *wN = ds4_gpu_tensor_view(weights, (uint64_t)off * w_stride, (uint64_t)take * w_stride);
-                ds4_gpu_tensor *outN = ds4_gpu_tensor_view(out, (uint64_t)off * out_stride, (uint64_t)take * out_stride);
-                const int ok = xN && selN && wN && outN &&
-                    routed_moe_launch(outN, gate, up, mid, down, model_map, model_size,
-                        gate_offset, up_offset, down_offset, gate_type, down_type,
-                        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-                        expert_in_dim, expert_mid_dim, out_dim, selN, wN, n_total_expert, n_expert,
-                        clamp, xN, layer_index, take, allow_streaming, owned_filtered);
-                ds4_gpu_tensor_free(xN);
-                ds4_gpu_tensor_free(selN);
-                ds4_gpu_tensor_free(wN);
-                ds4_gpu_tensor_free(outN);
-                if (!ok) return 0;
-                off += take;
-            }
-            return 1;
-        }
+        /* A capacity shortfall here, or later in this same call (the
+         * compact-prefill staging allocation further down, sized off the
+         * same unique-expert count), is not handled here -- the caller,
+         * routed_moe_launch(), retries the whole attempt as a token-range
+         * split when this returns 0. See its comment for why. */
+        if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
+            !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                &table, selected, n_tokens * n_expert)) return 0;
+        allow_streaming = 1;
     }
 
     /* The aligned artifacts replace the raw expert tensors on integrated
@@ -26537,6 +26515,109 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;
+}
+
+/* Replays [0, n_tokens) of routed_moe_launch_once()'s token-major tensors
+ * (x/selected/weights/out; gate/up/mid/down are pure scratch, safely reused
+ * across sequential sub-calls) as a sequence of routed_moe_launch() calls of
+ * at most g_moe_ssd_split_hint tokens each -- the caller has already shrunk
+ * the hint (or determined the existing hint is already tighter than
+ * n_tokens) before calling this. MoE has no cross-token dependency (every
+ * row's routed compute is self-contained), so this is exact, not an
+ * approximation: output is byte-identical to processing the full range in
+ * one shot, just slower. */
+static int routed_moe_launch_split(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t layer_index, uint32_t n_tokens, int allow_streaming, int owned_filtered) {
+    const uint32_t chunk = g_moe_ssd_split_hint < n_tokens ? g_moe_ssd_split_hint :
+        (n_tokens / 2u ? n_tokens / 2u : 1u);
+    const uint64_t x_stride = (uint64_t)expert_in_dim * sizeof(float);
+    const uint64_t sel_stride = (uint64_t)n_expert * sizeof(int32_t);
+    const uint64_t w_stride = (uint64_t)n_expert * sizeof(float);
+    const uint64_t out_stride = (uint64_t)out_dim * sizeof(float);
+    for (uint32_t off = 0; off < n_tokens; ) {
+        const uint32_t take = n_tokens - off < chunk ? n_tokens - off : chunk;
+        ds4_gpu_tensor *xN = ds4_gpu_tensor_view(x, (uint64_t)off * x_stride, (uint64_t)take * x_stride);
+        ds4_gpu_tensor *selN = ds4_gpu_tensor_view(selected, (uint64_t)off * sel_stride, (uint64_t)take * sel_stride);
+        ds4_gpu_tensor *wN = ds4_gpu_tensor_view(weights, (uint64_t)off * w_stride, (uint64_t)take * w_stride);
+        ds4_gpu_tensor *outN = ds4_gpu_tensor_view(out, (uint64_t)off * out_stride, (uint64_t)take * out_stride);
+        const int ok = xN && selN && wN && outN &&
+            routed_moe_launch(outN, gate, up, mid, down, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selN, wN, n_total_expert, n_expert,
+                clamp, xN, layer_index, take, allow_streaming, owned_filtered);
+        ds4_gpu_tensor_free(xN);
+        ds4_gpu_tensor_free(selN);
+        ds4_gpu_tensor_free(wN);
+        ds4_gpu_tensor_free(outN);
+        if (!ok) return 0;
+        off += take;
+    }
+    return 1;
+}
+
+/* Public entry point: one attempt at routed_moe_launch_once() for the whole
+ * n_tokens batch, falling back to a token-range split on failure. This
+ * catches every SSD-streaming VRAM shortfall in one place, not just the
+ * expert-cache load: routed_moe_launch_once() has a second allocation
+ * further in (the compact-prefill staging buffer, also sized off the
+ * batch's unique-expert count) that can independently run out of room on a
+ * card tight enough that the cache barely fits -- both fail this call the
+ * same way, both are fixed the same way, and only the wrapper needs to know
+ * that; routed_moe_launch_once() just needs to return 0.
+ *
+ * Skipping straight to a hint-sized split (instead of always trying the
+ * full n_tokens first) matters once a long prefill has already learned the
+ * real, currently-achievable capacity is well under one layer's token
+ * count: without this, every layer would re-waste a doomed full-size
+ * attempt before falling back, and a --ctx in the 100K range easily has
+ * hundreds of layer-major chunks. g_moe_ssd_split_hint only ever shrinks
+ * (real available VRAM tightens as the KV cache grows during a long
+ * prefill, never loosens, so a stale smaller hint is always still safe),
+ * and recursion through routed_moe_launch_split() bottoms out at
+ * n_tokens == 1 (unique experts capped at n_expert, always within any sane
+ * budget), where a further failure is a genuine resource failure, not a
+ * batching one, and is reported as such rather than looping forever. */
+static int routed_moe_launch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t layer_index, uint32_t n_tokens, int allow_streaming, int owned_filtered) {
+    const bool splittable = g_ssd_streaming_mode && !owned_filtered && n_tokens > 1;
+    const bool skip_direct = splittable && n_tokens > g_moe_ssd_split_hint;
+    if (!skip_direct) {
+        if (routed_moe_launch_once(out, gate, up, mid, down, model_map, model_size,
+                gate_offset, up_offset, down_offset, gate_type, down_type,
+                gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert, n_expert,
+                clamp, x, layer_index, n_tokens, allow_streaming, owned_filtered)) {
+            return 1;
+        }
+        if (!splittable) return 0;
+        /* Only shrink here, having just learned n_tokens itself doesn't fit --
+         * the skip_direct path above already knows n_tokens > the hint and
+         * has nothing new to report, so it must not perturb the hint. */
+        const uint32_t shrunk = n_tokens / 2u ? n_tokens / 2u : 1u;
+        if (shrunk < g_moe_ssd_split_hint) g_moe_ssd_split_hint = shrunk;
+    }
+    return routed_moe_launch_split(out, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert, n_expert,
+        clamp, x, layer_index, n_tokens, allow_streaming, owned_filtered);
 }
 
 extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
