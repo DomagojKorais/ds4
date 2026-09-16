@@ -13,10 +13,11 @@ experts. SSD streaming's job is running a model *larger than RAM*: a miss
 reads from disk, and the flag's name says so. DMA streaming's job is running
 a model that fits in RAM but not VRAM, as fast as a PCIe-attached card can:
 once the mapping is registered, the file is never read again -- misses come
-from RAM over PCIe, not from storage. The two are mutually exclusive and
-refused together at startup; pick the one that matches your constraint
-(model doesn't fit in VRAM but fits in RAM: `--dma-streaming`; model doesn't
-fit in RAM either: `--ssd-streaming`).
+from RAM over PCIe, not from storage. Pick the one that matches your
+constraint (model fits in RAM but not VRAM: `--dma-streaming`; model doesn't
+fit in RAM either: `--ssd-streaming`) -- or, when the model is bigger than
+RAM but not by an amount that leaves nothing worth pinning, pass both
+together for [hybrid streaming](#hybrid-ram-tier-plus-disk-tier).
 
 ## Use it
 
@@ -37,6 +38,40 @@ ds4: --dma-streaming could not be enabled: model does not fit host RAM (80.76 Gi
 Like SSD streaming, the expert-cache budget is picked automatically from
 free VRAM by default; `--ssd-streaming-cache-experts N|NGB` requests an
 explicit one instead, subject to the same fit.
+
+## Hybrid: RAM tier plus disk tier
+
+For a model bigger than host RAM, pass `--dma-streaming` and
+`--ssd-streaming` together:
+
+```sh
+./ds4 --cuda -m ds4flash.gguf --dma-streaming --ssd-streaming --ctx 32768
+```
+
+This is a third mode, not both modes running at once: DMA-register only the
+routed-expert layers that fit host RAM, and `pread()` the rest, in the same
+bounded device-side expert cache either transport would use alone. Startup
+picks whole routed-expert layers, from layer 0 upward, until adding the next
+one would exceed the host RAM budget -- available memory minus a 16 GiB
+reserve by default (pinned pages are not reclaimable, so this reserve is
+real memory held back, not a cushion), or an explicit
+`--dma-host-cache NGB`. It reports what it picked:
+
+```
+ds4: hybrid streaming: 26 of 40 routed-expert layers pinned (94.00 GiB host RAM budget)
+```
+
+A cache miss for an expert inside a pinned layer takes the direct-DMA path
+above; a miss for anything else falls back to the ordinary `pread()` +
+staging path. Both are byte-identical to a fully resident run at `--temp 0`
+-- the split changes throughput, not output.
+
+Picking whole layers by ascending index is a starting point, not a claim
+that index order is the ideal one to pin: a future refinement could pick by
+measured expert popularity instead (see `ds4_streaming_hotlist.inc`), but
+that data doesn't exist for every model yet, and layer order already gets
+most of the benefit since every layer is used on every token regardless of
+which of its experts are selected.
 
 ## Why this and not just faster SSD streaming
 
@@ -101,15 +136,19 @@ A card with little VRAM margin can see the auto-sized expert-cache budget
 compete with two other CUDA allocators that do not back off gracefully:
 `cuda_tmp_alloc()`'s shared scratch slab (grown to whatever the largest
 per-layer temporary has needed so far) and the on-demand non-routed weight
-arena, which has no fixed ceiling. Under `--dma-streaming` the reserve
-subtracted before sizing the cache is 10 GiB, raised there through two real
-failures on this card: 8 GiB (the reserve plain `--ssd-streaming` still
-uses, unchanged) OOM'd through `ds4-server` on a short prompt; 9 GiB left
-0.19 GiB free on an 8355-token tool-calling prefill; 10 GiB left 3.47+ GiB,
-validated at `--ctx 32768` and a genuine ~100K-token prompt at
-`--ctx 131072`. `DS4_CUDA_SSD_CACHE_RESERVE_MB` overrides it without a
-rebuild if a request fails with "cannot stage N experts with system
-headroom" or a later out-of-memory during prefill.
+arena, which has no fixed ceiling. Under whole-file `--dma-streaming` the
+reserve subtracted before sizing the cache is 10 GiB, raised there through
+two real failures on this card: 8 GiB (the reserve plain `--ssd-streaming`
+still uses, unchanged) OOM'd through `ds4-server` on a short prompt; 9 GiB
+left 0.19 GiB free on an 8355-token tool-calling prefill; 10 GiB left
+3.47+ GiB, validated at `--ctx 32768` and a genuine ~100K-token prompt at
+`--ctx 131072`. Hybrid streaming uses the plain 8 GiB reserve, not the
+10 GiB one: its non-routed resident footprint differs per model, so the
+figure tuned specifically for whole-file V4 Flash DMA isn't known to
+transfer without its own validation. `DS4_CUDA_SSD_CACHE_RESERVE_MB`
+overrides either reserve without a rebuild if a request fails with "cannot
+stage N experts with system headroom" or a later out-of-memory during
+prefill.
 
 ## Diagnostics
 

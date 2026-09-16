@@ -16,7 +16,12 @@ On a discrete CUDA card, if the model fits in host RAM but not VRAM,
 choice: it DMAs routed-expert misses straight from a registered model
 mapping instead of reading them from disk, since there is no disk read
 needed once the whole file is already in RAM. Use SSD streaming instead when
-the model does not fit in RAM either.
+the model does not fit in RAM either. When the model is bigger than RAM but
+not by an amount that leaves nothing worth pinning, pass `--dma-streaming`
+and `--ssd-streaming` together for the [hybrid RAM tier plus disk tier]
+(DMA_STREAMING.md#hybrid-ram-tier-plus-disk-tier): DMA-register only the
+routed-expert layers that fit host RAM and `pread()` the rest, instead of
+sending every miss to disk.
 
 ## Start with the automatic budget
 

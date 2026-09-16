@@ -4636,6 +4636,24 @@ int ds4_gpu_dma_streaming_status(const char **reason) {
     return 0;
 }
 
+/* Hybrid streaming is a discrete-CUDA-only transport, same reasoning as
+ * plain DMA streaming above. */
+void ds4_gpu_set_hybrid_streaming(bool enabled) {
+    (void)enabled;
+}
+
+int ds4_gpu_register_model_spans(const uint64_t *offs, const uint64_t *ends,
+                                 uint32_t n, const char **reason) {
+    (void)offs; (void)ends; (void)n;
+    if (reason) *reason = "requires a CUDA build on a discrete GPU";
+    return 0;
+}
+
+void ds4_gpu_dma_span_stats(uint64_t *hits, uint64_t *misses) {
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+}
+
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
 }

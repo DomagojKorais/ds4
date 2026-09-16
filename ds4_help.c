@@ -175,7 +175,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
-    opt(fp, c, "--dma-streaming", "Discrete CUDA: stream routed experts by DMA from a registered model mapping. Needs the model to fit in host RAM. Mutually exclusive with --ssd-streaming; see docs/DMA_STREAMING.md.");
+    opt(fp, c, "--dma-streaming", "Discrete CUDA: stream routed experts by DMA from a registered model mapping. Needs the model to fit in host RAM. Passed together with --ssd-streaming, selects hybrid streaming instead: DMA-register only the routed-expert layers that fit host RAM, pread() the rest; see docs/DMA_STREAMING.md.");
+    opt(fp, c, "--dma-host-cache NGB", "Hybrid streaming only (--dma-streaming --ssd-streaming together): host RAM budget for the pinned routed-expert tier. Default: available host memory minus a 16 GiB reserve.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {

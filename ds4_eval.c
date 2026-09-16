@@ -1211,6 +1211,7 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool dma_streaming;
+    uint64_t dma_host_cache_bytes;
     bool self_test_extractors;
     bool validate_cases;
     bool list_cases;
@@ -1724,6 +1725,13 @@ static eval_config parse_options(int argc, char **argv) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--dma-streaming")) {
             c.dma_streaming = true;
+        } else if (!strcmp(arg, "--dma-host-cache")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.dma_host_cache_bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --dma-host-cache must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -4792,6 +4800,7 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .dma_streaming = cfg.dma_streaming,
+        .dma_host_cache_bytes = cfg.dma_host_cache_bytes,
         .distributed = cfg.dist,
         .tp = cfg.tp,
     };

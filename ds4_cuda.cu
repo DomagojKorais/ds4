@@ -124,6 +124,30 @@ static int g_model_dma_failed;
 /* Why the registered-mapping DMA path is not live, valid whenever
  * g_model_dma_registered is 0. Read by ds4_gpu_dma_streaming_status(). */
 static char g_model_dma_reason[192] = "not attempted";
+/* Hybrid streaming (--dma-streaming --ssd-streaming together): pin and
+ * DMA-register only the routed-expert byte ranges that fit host RAM,
+ * chosen in ds4.c from model geometry via ds4_gpu_register_model_spans();
+ * the rest still pread()s. Distinct from g_dma_streaming_mode /
+ * g_model_dma_registered above, which cover the whole-file pure-DMA mode --
+ * ds4.c only ever drives one of the two for a given run (both flags
+ * together select this one instead of pure DMA). See
+ * docs/DMA_STREAMING.md. */
+static int g_hybrid_streaming_mode;
+typedef struct { uint64_t off, end; } cuda_dma_span;
+/* As given by ds4_gpu_register_model_spans(), unaligned, kept so a later
+ * fd/map switch back to the same model (mirroring pure DMA's re-arm
+ * pattern in cuda_model_apply_page_cache_policy()) can re-derive the
+ * registered set without ds4.c having to call in again. */
+static std::vector<cuda_dma_span> g_model_dma_span_specs;
+/* Currently registered, page-aligned, sorted by off and disjoint. */
+static std::vector<cuda_dma_span> g_model_dma_spans;
+static const void *g_model_dma_span_base;
+/* Diagnostic only (the log line in cuda_model_register_hybrid_spans()); not
+ * read back by any caller, hence the unused-attribute. */
+static uint64_t g_model_dma_span_bytes DS4_CUDA_UNUSED;
+static uint64_t g_model_dma_span_hits;
+static uint64_t g_model_dma_span_misses;
+static char g_hybrid_dma_reason[192] = "not attempted";
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -2321,6 +2345,37 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     return 1;
 }
 
+/* Hybrid streaming only. Returns a host pointer for [offset, offset+bytes)
+ * when that whole range is registered, NULL otherwise -- a range straddling
+ * a span boundary (or landing entirely outside every span) is a miss, not a
+ * partial hit; the caller falls through to the ordinary pread() path for
+ * it, which is correct by construction since spans are inward page-aligned
+ * (see cuda_model_register_hybrid_spans()). g_model_dma_spans is sorted by
+ * off and disjoint, so one binary search on the span whose end is past
+ * offset is enough. */
+static const char *cuda_model_dma_span_lookup(const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (g_model_dma_spans.empty() || model_map != g_model_dma_span_base || bytes == 0) return NULL;
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    size_t lo = 0, hi = g_model_dma_spans.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (g_model_dma_spans[mid].end <= offset) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo >= g_model_dma_spans.size()) {
+        g_model_dma_span_misses++;
+        return NULL;
+    }
+    const cuda_dma_span &s = g_model_dma_spans[lo];
+    if (s.off <= offset && end <= s.end) {
+        g_model_dma_span_hits++;
+        return (const char *)model_map + offset;
+    }
+    g_model_dma_span_misses++;
+    return NULL;
+}
+
 static int cuda_model_copy_to_device_streamed(
         char *dst,
         const void *model_map,
@@ -2351,6 +2406,25 @@ static int cuda_model_copy_to_device_streamed(
         }
         chunk_idx++;
         return 1;
+    }
+
+    if (g_hybrid_streaming_mode) {
+        const char *host_ptr = cuda_model_dma_span_lookup(model_map, offset, bytes);
+        if (host_ptr) {
+            /* Same transport as the pure-DMA branch above, straight from
+             * the registered span -- just a smaller registered region. */
+            cudaError_t err = cudaMemcpyAsync(dst, host_ptr, (size_t)bytes,
+                                              cudaMemcpyHostToDevice, g_model_dma_stream);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA hybrid-DMA copy failed for %s at %.2f MiB: %s\n",
+                        what ? what : "expert", (double)offset / 1048576.0, cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+            chunk_idx++;
+            return 1;
+        }
+        /* Miss: fall through to the ordinary pread() + staging path below. */
     }
 
     if (g_model_fd < 0 ||
@@ -4696,15 +4770,171 @@ static void cuda_model_try_register_for_direct_dma(const void *model_map, uint64
             (double)model_size / 1073741824.0, (double)cost / 1073741824.0);
 }
 
-/* --dma-streaming only. Settles g_model_keep_pages and, when the model
- * qualifies, closes the direct-I/O fd ds4_gpu_set_model_fd() opens below
- * (direct reads would bypass the very page cache DMA streaming needs) and
- * registers the mapping for direct DMA. A no-op whenever g_dma_streaming_mode
- * is off, so plain --ssd-streaming and resident loads are byte-for-byte
- * unaffected. Called from both ds4_gpu_set_model_fd() and
- * ds4_gpu_set_dma_streaming(): the placement paths invoke those two in
- * either order, and the policy needs both the fd and the mode to be final. */
+/* Hybrid streaming only. Unregisters every currently pinned span (the
+ * exact pointers cudaHostRegister was given -- page-aligned span starts,
+ * recoverable from g_model_dma_spans since alignment only ever shrinks a
+ * span inward). Does not touch g_model_dma_span_specs: those are the
+ * ds4.c-chosen byte ranges, still valid for a later re-registration against
+ * the same model. */
+static void cuda_model_unregister_dma_spans(void) {
+    for (const cuda_dma_span &s : g_model_dma_spans) {
+        if (!g_model_dma_span_base) continue;
+        void *p = (void *)((const char *)g_model_dma_span_base + s.off);
+        (void)cudaHostUnregister(p);
+        (void)cudaGetLastError();
+    }
+    g_model_dma_spans.clear();
+    g_model_dma_span_base = NULL;
+    g_model_dma_span_bytes = 0;
+}
+
+/* Hybrid streaming only. Registers every span in g_model_dma_span_specs
+ * (as given by ds4_gpu_register_model_spans()) against base, inward-aligned
+ * to the page size so two spans can never claim the same page -- the few
+ * edge bytes outside alignment simply miss cuda_model_dma_span_lookup() and
+ * fall back to pread(), correct by construction. Unlike
+ * cuda_model_try_register_for_direct_dma() (one whole-mapping call) this
+ * issues one cudaHostRegister per span but budgets their total VRAM cost
+ * together against the same 2 GiB cap, and rolls every span in this attempt
+ * back together on any failure -- ds4.c already sized the spec list to fit,
+ * so a failure here means the driver's real cost differs from the docs'
+ * measured ratio, not that the request needs shrinking by hand.
+ *
+ * Always re-derives from g_model_dma_span_specs rather than trusting the
+ * caller to pass a stable set: cuda_model_apply_page_cache_policy() calls
+ * this on every fd/map settle (mirroring the pure-DMA re-arm pattern), so
+ * a spec list set once by ds4.c survives an unrelated fd switch and back. */
+static int cuda_model_register_hybrid_spans(const void *base) {
+    cuda_model_unregister_dma_spans();
+    if (!base || g_model_dma_span_specs.empty()) {
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason), "no spans to register");
+        return 0;
+    }
+    if (getenv("DS4_CUDA_NO_DMA_STREAMING") != NULL) {
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason),
+                 "disabled via DS4_CUDA_NO_DMA_STREAMING");
+        return 0;
+    }
+    const long pagesize_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page = pagesize_l > 0 ? (uint64_t)pagesize_l : 4096u;
+    std::vector<cuda_dma_span> spans;
+    spans.reserve(g_model_dma_span_specs.size());
+    for (const cuda_dma_span &raw : g_model_dma_span_specs) {
+        const uint64_t off = (raw.off + page - 1) / page * page;
+        const uint64_t end = raw.end / page * page;
+        if (end > off) spans.push_back({off, end});
+    }
+    if (spans.empty()) {
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason),
+                 "no page-aligned spans after rounding");
+        return 0;
+    }
+    /* Prewarm sequentially before registering: cudaHostRegister on a cold
+     * file-backed mapping faults page by page, which is far slower than a
+     * streaming read of the same bytes. */
+    for (const cuda_dma_span &s : spans) {
+        const char *p = (const char *)base + s.off;
+        const uint64_t len = s.end - s.off;
+#if defined(POSIX_MADV_WILLNEED)
+        (void)posix_madvise((void *)(uintptr_t)p, (size_t)len, POSIX_MADV_WILLNEED);
+#endif
+        volatile unsigned char sink = 0;
+        for (uint64_t o = 0; o < len; o += page) sink ^= (unsigned char)p[o];
+        (void)sink;
+    }
+    size_t free_before = 0, total_bytes = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_before, &total_bytes), "hybrid DMA registration budget check")) {
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason), "cudaMemGetInfo failed before registration");
+        return 0;
+    }
+    std::vector<cuda_dma_span> registered;
+    registered.reserve(spans.size());
+    for (const cuda_dma_span &s : spans) {
+        void *p = (void *)((const char *)base + s.off);
+        cudaError_t err = cudaHostRegister(p, (size_t)(s.end - s.off), cudaHostRegisterReadOnly);
+        if (err != cudaSuccess) {
+            snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason),
+                     "cudaHostRegister failed at span %zu/%zu: %s",
+                     registered.size() + 1, spans.size(), cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            break;
+        }
+        registered.push_back(s);
+    }
+    if (registered.size() != spans.size()) {
+        for (const cuda_dma_span &s : registered) {
+            void *p = (void *)((const char *)base + s.off);
+            (void)cudaHostUnregister(p);
+            (void)cudaGetLastError();
+        }
+        return 0;
+    }
+    size_t free_after = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_after, &total_bytes), "hybrid DMA registration cost check")) {
+        for (const cuda_dma_span &s : registered) {
+            void *p = (void *)((const char *)base + s.off);
+            (void)cudaHostUnregister(p);
+            (void)cudaGetLastError();
+        }
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason), "cudaMemGetInfo failed after registration");
+        return 0;
+    }
+    const uint64_t cost = free_before > free_after ? (uint64_t)(free_before - free_after) : 0;
+    const uint64_t max_cost = UINT64_C(2) << 30; /* Same known-small budget as whole-file registration. */
+    if (cost > max_cost) {
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason),
+                 "registration cost %.2f GiB exceeds the %.0f GiB budget",
+                 (double)cost / 1073741824.0, (double)max_cost / 1073741824.0);
+        fprintf(stderr, "ds4: %s\n", g_hybrid_dma_reason);
+        for (const cuda_dma_span &s : registered) {
+            void *p = (void *)((const char *)base + s.off);
+            (void)cudaHostUnregister(p);
+            (void)cudaGetLastError();
+        }
+        return 0;
+    }
+    if (!g_model_dma_stream &&
+        !cuda_ok(cudaStreamCreateWithFlags(&g_model_dma_stream, cudaStreamNonBlocking),
+                "hybrid DMA stream creation")) {
+        for (const cuda_dma_span &s : registered) {
+            void *p = (void *)((const char *)base + s.off);
+            (void)cudaHostUnregister(p);
+            (void)cudaGetLastError();
+        }
+        snprintf(g_hybrid_dma_reason, sizeof(g_hybrid_dma_reason), "CUDA stream creation failed");
+        return 0;
+    }
+    uint64_t total = 0;
+    for (const cuda_dma_span &s : registered) total += s.end - s.off;
+    g_model_dma_spans = std::move(registered);
+    g_model_dma_span_base = base;
+    g_model_dma_span_bytes = total;
+    g_model_dma_span_hits = 0;
+    g_model_dma_span_misses = 0;
+    g_hybrid_dma_reason[0] = '\0';
+    fprintf(stderr, "ds4: CUDA hybrid streaming: %zu span(s) pinned (%.2f GiB), %.3f GiB VRAM cost\n",
+            g_model_dma_spans.size(), (double)total / 1073741824.0, (double)cost / 1073741824.0);
+    return 1;
+}
+
+/* --dma-streaming and hybrid streaming only. Settles g_model_keep_pages
+ * (pure DMA) or re-registers the span set (hybrid), and closes the
+ * direct-I/O fd for pure DMA -- never for hybrid, which still needs it for
+ * the disk tier. A no-op whenever neither mode is on, so plain
+ * --ssd-streaming and resident loads are byte-for-byte unaffected. Called
+ * from both ds4_gpu_set_model_fd() and ds4_gpu_set_dma_streaming()/
+ * ds4_gpu_register_model_spans(): the placement paths invoke those in
+ * either order, and the policy needs the fd and the mode/specs to be
+ * final. */
 static void cuda_model_apply_page_cache_policy(void) {
+    if (g_hybrid_streaming_mode) {
+        /* No fit/host-RAM gate here: ds4.c already sized the span list to
+         * fit before calling ds4_gpu_register_model_spans(), and a span
+         * miss just falls back to pread() -- there is no "doesn't fit"
+         * failure mode to guard against the way pure DMA has one. */
+        if (!g_model_dma_span_specs.empty()) (void)cuda_model_register_hybrid_spans(g_model_fd_host_base);
+        return;
+    }
     if (!g_dma_streaming_mode) return;
     const int keep = cuda_model_want_host_pages();
     g_model_keep_pages = keep ? 1 : -1;
@@ -4732,6 +4962,7 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
      * memory. cuda_model_apply_page_cache_policy() below re-registers the
      * new mapping if the policy still calls for it. */
     cuda_model_unregister_for_direct_dma();
+    cuda_model_unregister_dma_spans();
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -27385,13 +27616,22 @@ struct cuda_stream_upload_batch {
     int finish() {
         if (!active) return 1;
         active = false;
-        if (g_model_dma_registered) {
-            if (cuda_ok(cudaStreamSynchronize(g_model_dma_stream), "direct-DMA batch drain"))
-                return 1;
-        } else if (!g_stream_selected_upload_stream || cuda_ok(
-                cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload")) {
-            return 1;
+        /* Hybrid streaming can populate a single batch from both transports --
+         * span hits land on g_model_dma_stream (cuda_model_copy_to_device_streamed's
+         * hybrid branch), span misses fall through to the ordinary pread/stage
+         * path and land on g_stream_selected_upload_stream -- so both streams
+         * need draining, not just one. Pure whole-file DMA (g_model_dma_registered)
+         * never mixes transports within a batch, so it only ever needs the one. */
+        bool ok = true;
+        if (g_model_dma_registered || g_hybrid_streaming_mode) {
+            if (g_model_dma_stream)
+                ok = cuda_ok(cudaStreamSynchronize(g_model_dma_stream), "direct-DMA batch drain") && ok;
         }
+        if (!g_model_dma_registered) {
+            if (g_stream_selected_upload_stream)
+                ok = cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload") && ok;
+        }
+        if (ok) return 1;
         /* A failed asynchronous copy must not turn into a cache hit later. */
         ds4_gpu_stream_expert_cache_prefetch_finish(true);
         g_stream_expert_by_gate.clear();
@@ -27467,7 +27707,14 @@ static int cuda_stream_selected_cache_begin_load(
                  * ds4-server on a short prompt; 9 GiB left 0.19 GiB free on an
                  * 8355-token tool-calling prefill; 10 GiB left 3.47+ GiB,
                  * validated at --ctx 32768 and --ctx 131072. See
-                 * docs/DMA_STREAMING.md. */
+                 * docs/DMA_STREAMING.md. Hybrid streaming
+                 * (g_hybrid_streaming_mode) deliberately falls through to
+                 * the plain 8 GiB reserve here, not the 10 GiB one: its
+                 * non-routed resident footprint differs per model (V4.1's
+                 * decode-static set is much larger than V4 Flash's), so the
+                 * 10 GiB figure above -- tuned specifically for V4 Flash
+                 * whole-file DMA -- isn't known to transfer. Override with
+                 * DS4_CUDA_SSD_CACHE_RESERVE_MB if a hybrid run needs more. */
                 reserve = (g_dma_streaming_mode ? UINT64_C(10) : UINT64_C(8)) << 30;
             }
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
@@ -34055,6 +34302,53 @@ extern "C" int ds4_gpu_dma_streaming_status(const char **reason) {
     if (g_model_dma_registered) return 1;
     if (reason) *reason = g_model_dma_reason[0] ? g_model_dma_reason : "not attempted";
     return 0;
+}
+
+/* Hybrid streaming (--dma-streaming --ssd-streaming together). See
+ * docs/DMA_STREAMING.md. Called from ds4_engine_open_internal() alongside
+ * ds4_gpu_set_ssd_streaming(); unlike ds4_gpu_set_dma_streaming() this does
+ * not itself attempt registration -- the span set isn't known yet at that
+ * point in startup (model geometry hasn't been validated), so registration
+ * happens later from ds4_gpu_register_model_spans(). Disabling drops any
+ * live registration and forgets the spec list, so a stale set from a
+ * previous engine in the same process can't leak into a new one. */
+extern "C" void ds4_gpu_set_hybrid_streaming(bool enabled) {
+    g_hybrid_streaming_mode = enabled ? 1 : 0;
+    if (!enabled) {
+        cuda_model_unregister_dma_spans();
+        g_model_dma_span_specs.clear();
+    }
+}
+
+/* Hybrid streaming only. offs[i]/ends[i] are absolute byte ranges into the
+ * currently mapped model file, as ds4.c chose them (whole routed-expert
+ * layers, in file order) to fit within its own host-RAM budget -- this call
+ * does no further fitting of its own, only page alignment and the existing
+ * 2 GiB VRAM-cost cap shared with pure DMA. Registers immediately when
+ * hybrid mode is on and a model fd is already set; otherwise just remembers
+ * the spec list for cuda_model_apply_page_cache_policy() to apply once both
+ * are true. Returns 0 on total failure (nothing registered); *reason
+ * explains why, matching ds4_gpu_dma_streaming_status()'s contract. */
+extern "C" int ds4_gpu_register_model_spans(const uint64_t *offs, const uint64_t *ends,
+                                            uint32_t n, const char **reason) {
+    g_model_dma_span_specs.clear();
+    g_model_dma_span_specs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        if (ends[i] > offs[i]) g_model_dma_span_specs.push_back({offs[i], ends[i]});
+    }
+    int ok = 1;
+    if (g_hybrid_streaming_mode && g_model_fd >= 0) {
+        ok = cuda_model_register_hybrid_spans(g_model_fd_host_base);
+    }
+    if (reason) {
+        *reason = g_hybrid_dma_reason[0] ? g_hybrid_dma_reason : (ok ? "" : "not attempted");
+    }
+    return ok;
+}
+
+extern "C" void ds4_gpu_dma_span_stats(uint64_t *hits, uint64_t *misses) {
+    if (hits) *hits = g_model_dma_span_hits;
+    if (misses) *misses = g_model_dma_span_misses;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {

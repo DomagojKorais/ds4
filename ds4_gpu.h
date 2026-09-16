@@ -245,6 +245,23 @@ void ds4_gpu_set_ssd_streaming(bool enabled);
  * valid to call any time, including before ds4_gpu_set_dma_streaming(). */
 void ds4_gpu_set_dma_streaming(bool enabled);
 int ds4_gpu_dma_streaming_status(const char **reason);
+/* Hybrid streaming (--dma-streaming --ssd-streaming together): DMA-register
+ * only the routed-expert byte ranges ds4.c picks to fit host RAM, and
+ * pread() the rest. Discrete CUDA only; a no-op stub elsewhere, mirroring
+ * ds4_gpu_set_dma_streaming() above. See docs/DMA_STREAMING.md.
+ * ds4_gpu_register_model_spans() takes absolute byte offsets into the
+ * currently mapped model file (offs[i], ends[i]) and does its own page
+ * alignment and VRAM-cost budgeting; it does not re-fit the request to
+ * host RAM, ds4.c already sized it. Returns 0 and sets *reason (when
+ * non-NULL) if nothing could be registered; a caller that requires hybrid
+ * streaming to be live should treat that as fatal the same way
+ * ds4_gpu_dma_streaming_status() failing is fatal for --dma-streaming.
+ * ds4_gpu_dma_span_stats() reports cumulative hit/miss counts against the
+ * registered set, for startup/benchmark diagnostics. */
+void ds4_gpu_set_hybrid_streaming(bool enabled);
+int ds4_gpu_register_model_spans(const uint64_t *offs, const uint64_t *ends,
+                                 uint32_t n, const char **reason);
+void ds4_gpu_dma_span_stats(uint64_t *hits, uint64_t *misses);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);

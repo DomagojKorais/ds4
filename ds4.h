@@ -163,9 +163,15 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     /* Discrete CUDA only: DMA routed experts straight from a registered
      * model mapping instead of paging them through SSD reads. Requires the
-     * whole model to fit in host RAM; mutually exclusive with
-     * ssd_streaming. See docs/DMA_STREAMING.md. */
+     * whole model to fit in host RAM. Passed together with ssd_streaming,
+     * it instead selects hybrid streaming (see dma_host_cache_bytes below):
+     * DMA-register only the layers that fit host RAM, pread() the rest.
+     * See docs/DMA_STREAMING.md. */
     bool dma_streaming;
+    /* Hybrid streaming only (dma_streaming && ssd_streaming): explicit host
+     * RAM budget for the pinned routed-expert tier, from --dma-host-cache.
+     * 0 means pick automatically from available host memory. */
+    uint64_t dma_host_cache_bytes;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;

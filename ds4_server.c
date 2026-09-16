@@ -15442,6 +15442,13 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--dma-streaming")) {
             c.engine.dma_streaming = true;
+        } else if (!strcmp(arg, "--dma-host-cache")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.engine.dma_host_cache_bytes)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --dma-host-cache must be a positive GiB value, e.g. 64GB");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.engine.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {

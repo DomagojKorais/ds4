@@ -162,6 +162,70 @@ int main(void) {
     CHECK(!ds4_gpu_dma_streaming_status(NULL));
     fprintf(stderr, "CUDA DMA streaming: disabling unregisters cleanly: PASS\n");
 
+    /* Hybrid streaming (--dma-streaming --ssd-streaming together): register
+     * only layer 0 whole, plus a deliberately non-tensor-aligned partial
+     * span for layer 1 that cuts through the middle of one expert's down
+     * tensor -- unlike ds4_streaming_build_dma_host_spans() in ds4.c
+     * (production always registers whole tensors, so a real run never
+     * straddles one), this directly exercises
+     * cuda_model_dma_span_lookup()'s full-containment-only rule: a read
+     * straddling the registered/unregistered boundary must miss, not
+     * partially hit, and the resulting pread() fallback still has to
+     * produce byte-correct output. Both transports are covered by the
+     * same reference comparison used above. */
+    /* The expert-cache map (host (layer,expert) -> device slot) survives an
+     * ssd_streaming toggle that stays enabled, so the reference and
+     * pure-DMA sections above have already left every expert of both
+     * layers VRAM-resident; without a real release here every lookup below
+     * would hit the device cache before ever reaching the transport this
+     * section means to test, and the span hit/miss counters would stay at
+     * zero. Toggling off then on forces cuda_stream_selected_cache_release(). */
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_hybrid_streaming(true);
+    {
+        const uint64_t layer0_off = 0, layer0_end = layer_bytes;
+        const uint64_t layer1_off = (uint64_t)1 * layer_bytes;
+        const uint64_t layer1_down_off = layer1_off + EXPERTS * gate_bytes * 2u;
+        /* Ends mid-expert inside layer 1's down region: down_bytes is
+         * page-aligned (36864 = 9*4096) in this fixture, so cutting at
+         * down_bytes/2 (18432, still 4096-aligned) alone would land back on
+         * a page boundary and not actually straddle after inward alignment
+         * -- offset by one page so the registered end falls strictly inside
+         * a page cuda_model_dma_span_lookup must reject as a partial hit. */
+        const uint64_t layer1_partial_end = layer1_down_off + down_bytes / 2u + 4096u;
+        uint64_t offs[2] = { layer0_off, layer1_off };
+        uint64_t ends[2] = { layer0_end, layer1_partial_end };
+        const char *reason = NULL;
+        CHECK(ds4_gpu_register_model_spans(offs, ends, 2, &reason));
+    }
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * gate_bytes + down_bytes);
+    ds4_gpu_set_streaming_expert_cache_budget(2u * EXPERTS);
+    for (unsigned pass = 0; pass < 3; pass++) for (unsigned k = 0; k < LAYERS; k++) {
+        const unsigned l = pass & 1 ? LAYERS - 1 - k : k;
+        const uint64_t g = (uint64_t)l * layer_bytes, u = g + EXPERTS * gate_bytes, d = u + EXPERTS * gate_bytes;
+        bool half = false;
+        CHECK(ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, down, model, model_bytes,
+            g, u, d, GATE_TYPE, DOWN_TYPE, gate_bytes, UNIT, down_bytes, UNIT,
+            DIM, DIM, DIM, si, sw, EXPERTS, SELECTED, 10, x, l, ROWS, &half, false));
+        float actual[ROWS * DIM];
+        CHECK(!half && ds4_gpu_tensor_read(out, 0, actual, (uint64_t)ROWS * DIM * 4));
+        for (unsigned i = 0; i < ROWS * DIM; i++)
+            CHECK(isfinite(actual[i]) &&
+                  fabsf(actual[i] - reference[l][i]) <= 2e-5f * (1 + fabsf(reference[l][i])));
+    }
+    {
+        uint64_t hits = 0, misses = 0;
+        ds4_gpu_dma_span_stats(&hits, &misses);
+        CHECK(hits > 0 && misses > 0);
+        fprintf(stderr,
+                "CUDA DMA streaming: hybrid registration mixes DMA hits (%llu) and pread "
+                "misses (%llu) through a straddling span, output matches reference: PASS\n",
+                (unsigned long long)hits, (unsigned long long)misses);
+    }
+    ds4_gpu_set_hybrid_streaming(false);
+    ds4_gpu_set_ssd_streaming(false);
+
     ds4_gpu_cleanup();
     return 0;
 }

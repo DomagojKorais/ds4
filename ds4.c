@@ -53,9 +53,13 @@
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_QWEN4_GPU 1
 #endif
-#ifdef DS4_ROCM_BUILD
+/* Was ROCm-only (that was the only caller); hybrid streaming's host-RAM
+ * budget (ds4_streaming_build_dma_host_spans() and its caller in
+ * ds4_engine_open_internal()) needs it on plain discrete CUDA too. The
+ * header is a no-op-on-failure /proc/meminfo reader with no platform
+ * guard of its own, so including it unconditionally is safe on every
+ * build, including Apple where callers simply never reach it. */
 #include "ds4_linux_memory.h"
-#endif
 
 #ifdef DS4_TEST_HOOKS
 static uint64_t ds4_test_ds41_native_evals;
@@ -8500,6 +8504,57 @@ static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
     }
     spans->len = out;
     return spans->len != 0;
+}
+
+/* Hybrid streaming only (see docs/DMA_STREAMING.md and
+ * ds4_gpu_register_model_spans() in ds4_cuda.cu). Picks whole routed-expert
+ * layers, in ascending layer order, that together fit within budget_bytes,
+ * and appends each one's gate/up/down tensors to *spans through the same
+ * span-vec machinery every other model-map caller in this file uses, so
+ * sorting/merging behaves identically (isolated PRO Q4 tensors excepted --
+ * hybrid targets IQ2_XXS/Q2_K experts today, which never isolate). Not
+ * placed next to ds4_streaming_routed_expert_bytes() above (its natural
+ * neighbor) because it needs this span-vec machinery, defined later in the
+ * file than that byte-accounting group.
+ *
+ * Whole layers only, greedy from layer 0: this is a starting point, not a
+ * claim that layer index is the ideal ordering -- ordering by measured
+ * expert popularity (ds4_streaming_hotlist.inc / DS4_EXPERT_HOTLIST) would
+ * likely pin a more effective set for the same budget, but that hotlist
+ * data doesn't exist for V4.1 yet, and this needs a working baseline before
+ * that refinement is worth it. Returns the number of layers selected (0 if
+ * none fit, leaving *spans zeroed) and otherwise leaves *spans finished
+ * (sorted, merged) and ready for ds4_gpu_register_model_spans(); the
+ * caller owns spans->v and must free() it, same as every other span-vec
+ * result in this file. */
+static uint32_t ds4_streaming_build_dma_host_spans(
+        const ds4_weights *weights,
+        uint64_t           budget_bytes,
+        ds4_model_map_span_vec *spans) {
+    if (spans) memset(spans, 0, sizeof(*spans));
+    if (!weights || !spans || budget_bytes == 0) return 0;
+
+    uint32_t chosen = 0;
+    uint64_t used = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+        const uint64_t layer_bytes = ds4_add_sat_u64(l->ffn_gate_exps->bytes,
+                ds4_add_sat_u64(l->ffn_up_exps->bytes, l->ffn_down_exps->bytes));
+        if (layer_bytes == 0) continue;
+        if (used > budget_bytes || layer_bytes > budget_bytes - used) break;
+        model_map_span_vec_include_one(spans, l->ffn_gate_exps);
+        model_map_span_vec_include_one(spans, l->ffn_up_exps);
+        model_map_span_vec_include_one(spans, l->ffn_down_exps);
+        used += layer_bytes;
+        chosen++;
+    }
+    if (chosen == 0 || !model_map_span_vec_finish(spans)) {
+        free(spans->v);
+        memset(spans, 0, sizeof(*spans));
+        return 0;
+    }
+    return chosen;
 }
 
 static DS4_MAYBE_UNUSED bool weights_model_map_spans(
@@ -42296,6 +42351,14 @@ struct ds4_engine {
     bool ssd_streaming_budget_finalized;
     bool ssd_streaming_static_decode_map;
     bool dma_streaming;
+    /* opt->dma_streaming && opt->ssd_streaming: the user asked for both
+     * transports together. dma_streaming (above) is still set true in this
+     * case too -- see ds4_engine_open_internal() -- so every existing "is
+     * DMA active" check keeps working; this field only distinguishes the
+     * sub-mode where the pinned tier is partial and pread() covers the
+     * rest. See docs/DMA_STREAMING.md. */
+    bool hybrid_streaming;
+    uint64_t dma_host_cache_bytes;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
@@ -70220,10 +70283,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * mapping instead of the SSD pread path); it does not fork a second
      * streaming engine. It still needs the bounded expert cache and
      * miss-handling that ssd_streaming gates elsewhere in this file, so
-     * turn that on too. The two flags read as mutually exclusive to the
-     * user (see the refusal below) because dma_streaming always implies
-     * ssd_streaming, never the other way around. */
+     * turn that on too. */
     if (e->dma_streaming) e->ssd_streaming = true;
+    /* Both flags passed together select hybrid streaming instead of pure
+     * whole-file DMA: DMA-register only the routed-expert layers that fit
+     * host RAM (ds4_streaming_build_dma_host_spans() below, once weight
+     * geometry is known), pread() the rest. dma_streaming above stays true
+     * either way so callers that only care "is DMA active" don't need to
+     * know about the split; hybrid_streaming is the finer distinction. */
+    e->hybrid_streaming = opt->dma_streaming && opt->ssd_streaming;
+    e->dma_host_cache_bytes = opt->dma_host_cache_bytes;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (opt->vision_path && opt->vision_path[0]) {
@@ -70467,14 +70536,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
-    if (opt->dma_streaming && opt->ssd_streaming) {
-        fprintf(stderr,
-                "ds4: --dma-streaming and --ssd-streaming are mutually exclusive; "
-                "--dma-streaming already streams (see docs/DMA_STREAMING.md)\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -71034,7 +71095,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
-        ds4_gpu_set_dma_streaming(e->dma_streaming);
+        /* Pure whole-file DMA and hybrid (partial, span-registered) DMA are
+         * distinct CUDA-side modes; e->dma_streaming alone doesn't say
+         * which, so gate the pure-mode setter on !hybrid_streaming here. */
+        ds4_gpu_set_dma_streaming(e->dma_streaming && !e->hybrid_streaming);
+        ds4_gpu_set_hybrid_streaming(e->hybrid_streaming);
         if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -71437,7 +71502,61 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-        if (e->dma_streaming) {
+        if (e->hybrid_streaming) {
+            /* Pinned pages are not reclaimable, so this reserve is real
+             * memory held back from the pinned tier, not a cushion against
+             * transient pressure -- covers this process's own host
+             * allocations, the graph, staging buffers, and the OS. See
+             * docs/DMA_STREAMING.md. */
+            const uint64_t host_reserve_bytes = UINT64_C(16) * 1073741824ull;
+            uint64_t budget_bytes = e->dma_host_cache_bytes;
+            if (budget_bytes == 0) {
+                uint64_t host_available = 0;
+                if (ds4_linux_nonmovable_memory(&host_available) &&
+                    host_available > host_reserve_bytes) {
+                    budget_bytes = host_available - host_reserve_bytes;
+                }
+            }
+            ds4_model_map_span_vec dma_host_spans;
+            const uint32_t dma_host_layers = budget_bytes ?
+                ds4_streaming_build_dma_host_spans(&e->weights, budget_bytes, &dma_host_spans) : 0;
+            if (dma_host_layers == 0) {
+                fprintf(stderr,
+                        "ds4: --dma-streaming --ssd-streaming could not fit even one routed-expert "
+                        "layer in the %.2f GiB host RAM budget; use --dma-host-cache to raise it "
+                        "explicitly, or drop --dma-streaming for plain --ssd-streaming\n",
+                        (double)budget_bytes / 1073741824.0);
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            uint64_t *offs = xmalloc((size_t)dma_host_spans.len * sizeof(*offs));
+            uint64_t *ends = xmalloc((size_t)dma_host_spans.len * sizeof(*ends));
+            for (uint32_t i = 0; i < dma_host_spans.len; i++) {
+                offs[i] = dma_host_spans.v[i].off;
+                ends[i] = dma_host_spans.v[i].end;
+            }
+            const char *reason = NULL;
+            const int registered = ds4_gpu_register_model_spans(offs, ends, dma_host_spans.len, &reason);
+            free(offs);
+            free(ends);
+            free(dma_host_spans.v);
+            if (!registered) {
+                fprintf(stderr,
+                        "ds4: --dma-streaming --ssd-streaming could not be enabled: %s\n",
+                        reason ? reason : "unknown reason");
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr, "ds4: hybrid streaming: %u of %u routed-expert layers pinned "
+                            "(%.2f GiB host RAM budget)\n",
+                    dma_host_layers, DS4_N_LAYER, (double)budget_bytes / 1073741824.0);
+        } else if (e->dma_streaming) {
             const char *reason = NULL;
             if (!ds4_gpu_dma_streaming_status(&reason)) {
                 fprintf(stderr,
