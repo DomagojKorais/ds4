@@ -24891,6 +24891,27 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* ds4_mmq_moe_pair_impl() (cuda/mmq/ds4_mmq.cu, backing the "aligned" fused
+ * IQ2_XXS/Q2_K streaming kernel below) allocates several working buffers via
+ * ggml_cuda_pool_alloc -- a ggml-style pool whose alloc() has no
+ * graceful-failure contract: CUDA_CHECK aborts the whole process on a
+ * cudaMallocAsync OOM (cuda/mmq/ds4_ggml_stubs.cu:196), unlike every other
+ * allocation this file's SSD-streaming path already recovers from. Their
+ * exact sizes aren't reproduced here; this is a coarse, conservative floor
+ * observed in practice to avoid that crash on a card tight enough that the
+ * SSD-streaming expert cache itself barely fits (RTX 3090, --ctx 131072,
+ * hybrid streaming, mid-conversation once the KV cache has grown). Skipping
+ * the fused/aligned kernel under genuine scarcity costs throughput, not
+ * correctness -- the unaligned kernel right below it covers the same math. */
+static bool cuda_moe_fused_direct_headroom_ok(void) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return free_bytes >= (UINT64_C(1) << 30);
+}
+
 /* Forward declaration: routed_moe_launch() (the public entry, defined after
  * routed_moe_launch_once() below) wraps a single attempt with a token-range
  * split/retry fallback, and that fallback recurses back into
@@ -25402,7 +25423,8 @@ static int routed_moe_launch_once(
         uint32_t mmq_experts = n_total_expert;
         const bool aligned = use_stream_selected_cache && n_tokens >= 128u &&
             n_assignments >= 1024u && expert_in_dim % 1024u == 0u &&
-            cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled();
+            cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled() &&
+            cuda_moe_fused_direct_headroom_ok();
         if (use_stream_selected_cache &&
             !cuda_stream_compact_prefill(&mmq_gate, &mmq_up, &mmq_down,
                                         &mmq_ids, &mmq_experts,
